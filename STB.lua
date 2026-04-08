@@ -23,7 +23,7 @@ local function normalizePath(baseDir, rel)
     return (baseDir or "") .. rel
 end
 
-local function buildMap(raw, baseDir, sourceName)
+local function buildMap(raw, baseDir)
     if type(raw) ~= "table" then
         print("STB buildMap failed: map data is not a table")
         return nil
@@ -32,15 +32,12 @@ local function buildMap(raw, baseDir, sourceName)
     local self = setmetatable({}, STB)
 
     self.raw = raw
-    self.path = sourceName or ""
     self.baseDir = baseDir or ""
-
     self.width = raw.width or 0
     self.height = raw.height or 0
     self.tilewidth = raw.tilewidth or 0
     self.tileheight = raw.tileheight or 0
     self.orientation = raw.orientation or "orthogonal"
-    self.renderorder = raw.renderorder or "right-down"
 
     if self.orientation ~= "orthogonal" then
         print("STB only supports orthogonal maps")
@@ -61,32 +58,13 @@ local function buildMap(raw, baseDir, sourceName)
 end
 
 function STB.fromTable(raw, baseDir)
-    return buildMap(raw, baseDir or "", "table")
-end
-
-function STB._safeRequire(moduleName)
-    package.loaded[moduleName] = nil
-    local ok, result = pcall(require, moduleName)
-    if ok then
-        return result, nil
-    end
-    return nil, result
-end
-
-function STB.fromModule(moduleName, baseDir)
-    local raw, err = STB._safeRequire(moduleName)
-    if not raw then
-        print("STB module load failed: " .. tostring(err))
-        return nil
-    end
-
-    return buildMap(raw, baseDir or "", moduleName)
+    return buildMap(raw, baseDir or "")
 end
 
 function STB:_loadTilesets(tilesets)
     for _, ts in ipairs(tilesets) do
         if ts.filename then
-            print("STB does not support external TSX tilesets. Please embed tilesets in Tiled.")
+            print("STB error: external TSX tilesets are not supported. Please embed tilesets in Tiled.")
             return
         end
 
@@ -96,20 +74,10 @@ function STB:_loadTilesets(tilesets)
         tileset._spacing = tileset.spacing or 0
         tileset._margin = tileset.margin or 0
         tileset._tilecount = tileset.tilecount or 0
-        tileset._tilesById = {}
 
         if tileset.image then
             tileset._imagePath = normalizePath(self.baseDir, tileset.image)
             tileset._image = Resources.load(tileset._imagePath)
-            if not tileset._image then
-                print("STB failed to load tileset image: " .. tostring(tileset._imagePath))
-            end
-        end
-
-        if tileset.tiles then
-            for _, tile in ipairs(tileset.tiles) do
-                tileset._tilesById[tile.id] = tile
-            end
         end
 
         table.insert(self.tilesets, tileset)
@@ -128,7 +96,6 @@ function STB:_loadLayers(layers)
     for _, layer in ipairs(layers) do
         local L = copyTable(layer)
         L.visible = (L.visible ~= false)
-        L.opacity = L.opacity or 1
         L.offsetx = L.offsetx or 0
         L.offsety = L.offsety or 0
 
@@ -136,14 +103,6 @@ function STB:_loadLayers(layers)
             self:_prepareTileLayer(L)
         elseif L.type == "objectgroup" then
             L.objects = L.objects or {}
-        elseif L.type == "imagelayer" then
-            if L.image then
-                L._imagePath = normalizePath(self.baseDir, L.image)
-                L._image = Resources.load(L._imagePath)
-                if not L._image then
-                    print("STB failed to load image layer: " .. tostring(L._imagePath))
-                end
-            end
         end
 
         table.insert(self.layers, L)
@@ -201,22 +160,10 @@ function STB:render(camX, camY)
     camY = camY or 0
 
     for _, layer in ipairs(self.layers) do
-        if layer.visible then
-            if layer.type == "tilelayer" then
-                self:_renderTileLayer(layer, camX, camY)
-            elseif layer.type == "imagelayer" then
-                self:_renderImageLayer(layer, camX, camY)
-            end
+        if layer.visible and layer.type == "tilelayer" then
+            self:_renderTileLayer(layer, camX, camY)
         end
     end
-end
-
-function STB:_renderImageLayer(layer, camX, camY)
-    if not layer._image then
-        return
-    end
-
-    tex(layer._image, layer.offsetx + camX, layer.offsety + camY)
 end
 
 function STB:_renderTileLayer(layer, camX, camY)
@@ -225,16 +172,14 @@ function STB:_renderTileLayer(layer, camX, camY)
 
     for y = 1, #layer._cells do
         local row = layer._cells[y]
-        if row then
-            for x = 1, #row do
-                local cell = row[x]
-                if cell and cell.tileset and cell.tileset._image then
-                    local sx, sy, sw, sh = self:_getTileSourceRect(cell.tileset, cell.localId)
-                    local dx = (x - 1) * tw + layer.offsetx + camX
-                    local dy = (y - 1) * th + layer.offsety + camY
+        for x = 1, #row do
+            local cell = row[x]
+            if cell and cell.tileset and cell.tileset._image then
+                local sx, sy, sw, sh = self:_getTileSourceRect(cell.tileset, cell.localId)
+                local dx = (x - 1) * tw + layer.offsetx + camX
+                local dy = (y - 1) * th + layer.offsety + camY
 
-                    tex(cell.tileset._image, dx, dy, tw, th, sx, sy, sw, sh)
-                end
+                tex(cell.tileset._image, dx, dy, tw, th, sx, sy, sw, sh)
             end
         end
     end
@@ -265,34 +210,6 @@ function STB:getObject(layerName, objectName)
         end
     end
     return nil
-end
-
-function STB:worldToTile(wx, wy)
-    local tx = math.floor(wx / self.tilewidth) + 1
-    local ty = math.floor(wy / self.tileheight) + 1
-    return tx, ty
-end
-
-function STB:tileToWorld(tx, ty)
-    return (tx - 1) * self.tilewidth, (ty - 1) * self.tileheight
-end
-
-function STB:getTileGid(layerName, tx, ty)
-    local layer = self:getLayer(layerName)
-    if not layer or layer.type ~= "tilelayer" then
-        return 0
-    end
-
-    if not layer._cells[ty] then
-        return 0
-    end
-
-    local cell = layer._cells[ty][tx]
-    if not cell then
-        return 0
-    end
-
-    return cell.gid or 0
 end
 
 return STB
