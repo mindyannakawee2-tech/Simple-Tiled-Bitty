@@ -31,54 +31,37 @@ local function normalizePath(baseDir, rel)
     return baseDir .. rel
 end
 
-local function hasBit(value, bit)
-    return value % (bit + bit) >= bit
-end
-
-local FLIP_H = 0x80000000
-local FLIP_V = 0x40000000
-local FLIP_D = 0x20000000
-
-local function decodeGid(raw)
-    local gid = raw
-    local flipH = hasBit(gid, FLIP_H)
-    local flipV = hasBit(gid, FLIP_V)
-    local flipD = hasBit(gid, FLIP_D)
-
-    if flipH then gid = gid - FLIP_H end
-    if flipV then gid = gid - FLIP_V end
-    if flipD then gid = gid - FLIP_D end
-
-    return gid, flipH, flipV, flipD
-end
-
-local function makeAnimState(tile)
-    if not tile.animation then
-        return nil
+local function safeLoadLua(path)
+    local ok, result = pcall(dofile, path)
+    if ok then
+        return result, nil
     end
-
-    return {
-        frames = tile.animation,
-        time = 0,
-        index = 1
-    }
+    return nil, result
 end
 
 function STB.new(mapPath)
-    local raw = assert(dofile(mapPath), "Failed to load map: " .. tostring(mapPath))
+    local raw, err = safeLoadLua(mapPath)
+    if not raw then
+        print("STB load failed: " .. tostring(err))
+        return nil
+    end
+
     local self = setmetatable({}, STB)
 
     self.raw = raw
     self.path = mapPath
     self.baseDir = getDir(mapPath)
 
-    self.width = raw.width
-    self.height = raw.height
-    self.tilewidth = raw.tilewidth
-    self.tileheight = raw.tileheight
-    self.orientation = raw.orientation
+    self.width = raw.width or 0
+    self.height = raw.height or 0
+    self.tilewidth = raw.tilewidth or 0
+    self.tileheight = raw.tileheight or 0
+    self.orientation = raw.orientation or "orthogonal"
 
-    assert(self.orientation == "orthogonal", "Only orthogonal maps supported.")
+    if self.orientation ~= "orthogonal" then
+        print("STB only supports orthogonal maps")
+        return nil
+    end
 
     self.pixelWidth = self.width * self.tilewidth
     self.pixelHeight = self.height * self.tileheight
@@ -95,13 +78,17 @@ end
 
 function STB:_loadTilesets(tilesets)
     for _, ts in ipairs(tilesets) do
-        assert(not ts.filename, "External TSX tilesets not supported. Embed tilesets in Tiled.")
+        if ts.filename then
+            print("STB does not support external TSX tilesets yet. Embed tilesets in Tiled.")
+            return
+        end
 
         local tileset = copyTable(ts)
         tileset.firstgid = ts.firstgid
 
         if tileset.image then
             tileset._imagePath = normalizePath(self.baseDir, tileset.image)
+            print("Loading tileset image: " .. tostring(tileset._imagePath))
             tileset._image = Resources.load(tileset._imagePath)
         end
 
@@ -129,8 +116,55 @@ function STB:_loadTilesets(tilesets)
     end
 end
 
-function STB:_getTileInfo(gid)
-    return self.tileGidMap[gid]
+function STB:_loadLayers(layers)
+    for _, layer in ipairs(layers) do
+        local L = copyTable(layer)
+
+        L.visible = (L.visible ~= false)
+        L.offsetx = L.offsetx or 0
+        L.offsety = L.offsety or 0
+
+        if L.type == "tilelayer" then
+            self:_prepareTileLayer(L)
+        elseif L.type == "objectgroup" then
+            L.objects = L.objects or {}
+        elseif L.type == "imagelayer" then
+            if L.image then
+                L._imagePath = normalizePath(self.baseDir, L.image)
+                print("Loading image layer: " .. tostring(L._imagePath))
+                L._image = Resources.load(L._imagePath)
+            end
+        end
+
+        table.insert(self.layers, L)
+    end
+end
+
+function STB:_prepareTileLayer(layer)
+    layer._cells = {}
+
+    local data = layer.data or {}
+    local width = layer.width or self.width
+    local height = layer.height or self.height
+
+    for y = 1, height do
+        layer._cells[y] = {}
+        for x = 1, width do
+            local index = (y - 1) * width + x
+            local gid = data[index] or 0
+
+            if gid ~= 0 then
+                local info = self.tileGidMap[gid]
+                if info then
+                    layer._cells[y][x] = {
+                        gid = gid,
+                        tileset = info.tileset,
+                        localId = info.localId
+                    }
+                end
+            end
+        end
+    end
 end
 
 function STB:_getTileSourceRect(tileset, localId)
@@ -149,103 +183,9 @@ function STB:_getTileSourceRect(tileset, localId)
     return sx, sy, tw, th
 end
 
-function STB:_loadLayers(layers)
-    for _, layer in ipairs(layers) do
-        local L = copyTable(layer)
-
-        L.visible = (L.visible ~= false)
-        L.opacity = L.opacity or 1
-        L.offsetx = L.offsetx or 0
-        L.offsety = L.offsety or 0
-
-        if L.type == "tilelayer" then
-            self:_prepareTileLayer(L)
-        elseif L.type == "objectgroup" then
-            L.objects = L.objects or {}
-        elseif L.type == "imagelayer" then
-            if L.image then
-                L._imagePath = normalizePath(self.baseDir, L.image)
-                L._image = Resources.load(L._imagePath)
-            end
-        end
-
-        table.insert(self.layers, L)
-    end
-end
-
-function STB:_prepareTileLayer(layer)
-    layer._cells = {}
-    layer._animCells = {}
-
-    local data = layer.data or {}
-    local width = layer.width or self.width
-    local height = layer.height or self.height
-
-    for y = 1, height do
-        layer._cells[y] = {}
-        for x = 1, width do
-            local index = (y - 1) * width + x
-            local rawGid = data[index] or 0
-
-            if rawGid ~= 0 then
-                local gid, flipH, flipV, flipD = decodeGid(rawGid)
-                local info = self:_getTileInfo(gid)
-
-                if info then
-                    local tileDef = info.tileset._tilesById[info.localId]
-                    local anim = tileDef and makeAnimState(tileDef) or nil
-
-                    local cell = {
-                        gid = gid,
-                        rawGid = rawGid,
-                        flipH = flipH,
-                        flipV = flipV,
-                        flipD = flipD,
-                        tileset = info.tileset,
-                        localId = info.localId,
-                        anim = anim,
-                        x = x,
-                        y = y
-                    }
-
-                    layer._cells[y][x] = cell
-
-                    if anim then
-                        table.insert(layer._animCells, cell)
-                    end
-                end
-            end
-        end
-    end
-end
-
 function STB:update(dt)
-    for _, layer in ipairs(self.layers) do
-        if layer.type == "tilelayer" and layer._animCells then
-            for _, cell in ipairs(layer._animCells) do
-                local anim = cell.anim
-                if anim and #anim.frames > 0 then
-                    anim.time = anim.time + dt
-
-                    local current = anim.frames[anim.index]
-                    local frameDuration = (current.duration or 100) / 1000
-
-                    while anim.time >= frameDuration do
-                        anim.time = anim.time - frameDuration
-                        anim.index = anim.index + 1
-                        if anim.index > #anim.frames then
-                            anim.index = 1
-                        end
-                        current = anim.frames[anim.index]
-                        frameDuration = (current.duration or 100) / 1000
-                    end
-                end
-            end
-        end
-    end
 end
 
--- render map immediately from update()
 function STB:render(camX, camY)
     camX = camX or 0
     camY = camY or 0
@@ -266,10 +206,7 @@ function STB:_renderImageLayer(layer, camX, camY)
         return
     end
 
-    local dx = layer.offsetx + camX
-    local dy = layer.offsety + camY
-
-    drawImage(layer._image, dx, dy)
+    tex(layer._image, layer.offsetx + camX, layer.offsety + camY)
 end
 
 function STB:_renderTileLayer(layer, camX, camY)
@@ -280,21 +217,13 @@ function STB:_renderTileLayer(layer, camX, camY)
         local row = layer._cells[y]
         for x = 1, #row do
             local cell = row[x]
-            if cell then
-                local localId = cell.localId
-
-                if cell.anim then
-                    local frame = cell.anim.frames[cell.anim.index]
-                    localId = frame.tileid
-                end
-
-                local sx, sy, sw, sh = self:_getTileSourceRect(cell.tileset, localId)
+            if cell and cell.tileset and cell.tileset._image then
+                local sx, sy, sw, sh = self:_getTileSourceRect(cell.tileset, cell.localId)
                 local dx = (x - 1) * tw + layer.offsetx + camX
                 local dy = (y - 1) * th + layer.offsety + camY
 
-                -- IMPORTANT:
-                -- Replace this with Bitty's actual sub-image draw call if needed
-                drawImage(cell.tileset._image, dx, dy, sw, sh, sx, sy, sw, sh)
+                -- THIS PART MAY STILL NEED CHANGING FOR BITTY
+                tex(cell.tileset._image, dx, dy, tw, th, sx, sy, sw, sh)
             end
         end
     end
@@ -325,27 +254,6 @@ function STB:getObject(layerName, objectName)
         end
     end
     return nil
-end
-
-function STB:worldToTile(wx, wy)
-    local tx = math.floor(wx / self.tilewidth) + 1
-    local ty = math.floor(wy / self.tileheight) + 1
-    return tx, ty
-end
-
-function STB:tileToWorld(tx, ty)
-    return (tx - 1) * self.tilewidth, (ty - 1) * self.tileheight
-end
-
-function STB:getTileGid(layerName, tx, ty)
-    local layer = self:getLayer(layerName)
-    if not layer or layer.type ~= "tilelayer" then
-        return 0
-    end
-    if not layer._cells[ty] or not layer._cells[ty][tx] then
-        return 0
-    end
-    return layer._cells[ty][tx].gid
 end
 
 return STB
