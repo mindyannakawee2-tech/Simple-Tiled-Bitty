@@ -13,14 +13,6 @@ local function copyTable(t)
     return out
 end
 
-local function getDir(path)
-    local i = path:match("^.*()/")
-    if i then
-        return path:sub(1, i)
-    end
-    return ""
-end
-
 local function normalizePath(baseDir, rel)
     if not rel or rel == "" then
         return rel
@@ -28,24 +20,7 @@ local function normalizePath(baseDir, rel)
     if rel:sub(1, 1) == "/" then
         return rel
     end
-    return baseDir .. rel
-end
-
-local function safeRequire(moduleName)
-    package.loaded[moduleName] = nil
-    local ok, result = pcall(require, moduleName)
-    if ok then
-        return result, nil
-    end
-    return nil, result
-end
-
-local function safeDofile(path)
-    local ok, result = pcall(dofile, path)
-    if ok then
-        return result, nil
-    end
-    return nil, result
+    return (baseDir or "") .. rel
 end
 
 local function buildMap(raw, baseDir, sourceName)
@@ -85,27 +60,27 @@ local function buildMap(raw, baseDir, sourceName)
     return self
 end
 
-function STB.new(mapPath)
-    local raw, err = safeDofile(mapPath)
-    if not raw then
-        print("STB dofile load failed: " .. tostring(err))
-        return nil
-    end
-
-    return buildMap(raw, getDir(mapPath), mapPath)
+function STB.fromTable(raw, baseDir)
+    return buildMap(raw, baseDir or "", "table")
 end
 
-function STB.fromModule(moduleName)
-    local raw, err = safeRequire(moduleName)
+function STB._safeRequire(moduleName)
+    package.loaded[moduleName] = nil
+    local ok, result = pcall(require, moduleName)
+    if ok then
+        return result, nil
+    end
+    return nil, result
+end
+
+function STB.fromModule(moduleName, baseDir)
+    local raw, err = STB._safeRequire(moduleName)
     if not raw then
         print("STB module load failed: " .. tostring(err))
         return nil
     end
 
-    local pseudoPath = moduleName:gsub("%.", "/") .. ".lua"
-    local baseDir = getDir(pseudoPath)
-
-    return buildMap(raw, baseDir, moduleName)
+    return buildMap(raw, baseDir or "", moduleName)
 end
 
 function STB:_loadTilesets(tilesets)
@@ -116,7 +91,7 @@ function STB:_loadTilesets(tilesets)
         end
 
         local tileset = copyTable(ts)
-        tileset.firstgid = ts.firstgid or 1
+        tileset.firstgid = tileset.firstgid or 1
         tileset._columns = tileset.columns or 1
         tileset._spacing = tileset.spacing or 0
         tileset._margin = tileset.margin or 0
@@ -196,11 +171,7 @@ function STB:_prepareTileLayer(layer)
                         localId = info.localId,
                         tileset = info.tileset
                     }
-                else
-                    layer._cells[y][x] = nil
                 end
-            else
-                layer._cells[y][x] = nil
             end
         end
     end
@@ -223,7 +194,6 @@ function STB:_getTileSourceRect(tileset, localId)
 end
 
 function STB:update(dt)
-    -- reserved for animated tiles later
 end
 
 function STB:render(camX, camY)
@@ -246,11 +216,7 @@ function STB:_renderImageLayer(layer, camX, camY)
         return
     end
 
-    tex(
-        layer._image,
-        layer.offsetx + camX,
-        layer.offsety + camY
-    )
+    tex(layer._image, layer.offsetx + camX, layer.offsety + camY)
 end
 
 function STB:_renderTileLayer(layer, camX, camY)
@@ -267,14 +233,7 @@ function STB:_renderTileLayer(layer, camX, camY)
                     local dx = (x - 1) * tw + layer.offsetx + camX
                     local dy = (y - 1) * th + layer.offsety + camY
 
-                    -- Assumes Bitty tex() supports:
-                    -- tex(image, dx, dy, dw, dh, sx, sy, sw, sh)
-                    tex(
-                        cell.tileset._image,
-                        dx, dy,
-                        tw, th,
-                        sx, sy, sw, sh
-                    )
+                    tex(cell.tileset._image, dx, dy, tw, th, sx, sy, sw, sh)
                 end
             end
         end
@@ -288,10 +247,6 @@ function STB:getLayer(name)
         end
     end
     return nil
-end
-
-function STB:getLayers()
-    return self.layers
 end
 
 function STB:getObjects(layerName)
@@ -319,9 +274,7 @@ function STB:worldToTile(wx, wy)
 end
 
 function STB:tileToWorld(tx, ty)
-    local wx = (tx - 1) * self.tilewidth
-    local wy = (ty - 1) * self.tileheight
-    return wx, wy
+    return (tx - 1) * self.tilewidth, (ty - 1) * self.tileheight
 end
 
 function STB:getTileGid(layerName, tx, ty)
