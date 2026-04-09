@@ -17,7 +17,6 @@ end
 --
 I do supports Collision with ObjectLayer
 The ObjectLayer Name should be "CollisionLayer"
-but you need to write your own player collision
 --
 
 ## Tiled Layers
