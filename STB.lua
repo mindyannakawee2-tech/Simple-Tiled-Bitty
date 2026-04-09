@@ -1,215 +1,365 @@
-local STB = {}
-STB.__index = STB
+local Tiled = {}
 
-local function copyTable(t)
-    local out = {}
-    for k, v in pairs(t) do
-        if type(v) == "table" then
-            out[k] = copyTable(v)
+local function safeRequire(path)
+    local ok, result = pcall(require, path)
+    if ok then
+        return result
+    end
+    return nil
+end
+
+local function normalizeModulePath(path)
+    path = string.gsub(path, "\\", "/")
+    path = string.gsub(path, "%.tsx$", "")
+    path = string.gsub(path, "%.lua$", "")
+    path = string.gsub(path, "^%./", "")
+    path = string.gsub(path, "^%.%./", "")
+    return path
+end
+
+local function getTilesetForGid(tilesets, gid)
+    local best = nil
+    for i = 1, #tilesets do
+        local ts = tilesets[i]
+        if gid >= ts.firstgid then
+            best = ts
         else
-            out[k] = v
+            break
         end
+    end
+    return best
+end
+
+local function buildTilesets(mapData)
+    local tilesets = {}
+
+    for i = 1, #(mapData.tilesets or {}) do
+        local raw = mapData.tilesets[i]
+
+        if raw.filename then
+            local modPath = normalizeModulePath(raw.filename)
+            local ext = safeRequire(modPath)
+
+            if not ext or type(ext) ~= "table" then
+                error(
+                    'Cannot load external tileset. Map references "' .. tostring(raw.filename) ..
+                    '" so Bitty needs a Lua module at require path "' .. tostring(modPath) ..
+                    '". Create ' .. tostring(modPath) .. '.lua that returns a table.'
+                )
+            end
+
+            local ts = {}
+            ts.firstgid = raw.firstgid or 1
+            ts.name = ext.name or ("tileset" .. i)
+            ts.tilewidth = ext.tilewidth or mapData.tilewidth
+            ts.tileheight = ext.tileheight or mapData.tileheight
+            ts.tilecount = ext.tilecount or 0
+            ts.columns = ext.columns or 0
+            ts.image = ext.image
+            ts.imagewidth = ext.imagewidth or 0
+            ts.imageheight = ext.imageheight or 0
+            ts.imagePath = ext.image
+
+            if ts.columns == 0 and ts.tilewidth > 0 and ts.imagewidth > 0 then
+                ts.columns = math.floor(ts.imagewidth / ts.tilewidth)
+            end
+
+            table.insert(tilesets, ts)
+        else
+            local ts = {}
+            ts.firstgid = raw.firstgid or 1
+            ts.name = raw.name or ("tileset" .. i)
+            ts.tilewidth = raw.tilewidth or mapData.tilewidth
+            ts.tileheight = raw.tileheight or mapData.tileheight
+            ts.tilecount = raw.tilecount or 0
+            ts.columns = raw.columns or 0
+            ts.image = raw.image
+            ts.imagewidth = raw.imagewidth or 0
+            ts.imageheight = raw.imageheight or 0
+            ts.imagePath = raw.image
+
+            if ts.columns == 0 and ts.tilewidth > 0 and ts.imagewidth > 0 then
+                ts.columns = math.floor(ts.imagewidth / ts.tilewidth)
+            end
+
+            table.insert(tilesets, ts)
+        end
+    end
+
+    table.sort(tilesets, function(a, b)
+        return a.firstgid < b.firstgid
+    end)
+
+    return tilesets
+end
+
+local function copyProperties(props)
+    local out = {}
+    for k, v in pairs(props or {}) do
+        out[k] = v
     end
     return out
 end
 
-local function normalizePath(baseDir, rel)
-    if not rel or rel == "" then
-        return rel
-    end
-    if rel:sub(1, 1) == "/" then
-        return rel
-    end
-    return (baseDir or "") .. rel
+local function normalizeObject(obj)
+    return {
+        id = obj.id,
+        name = obj.name or "",
+        type = obj.type or "",
+        shape = obj.shape or "rectangle",
+        x = obj.x or 0,
+        y = obj.y or 0,
+        w = obj.width or 0,
+        h = obj.height or 0,
+        width = obj.width or 0,
+        height = obj.height or 0,
+        rotation = obj.rotation or 0,
+        visible = obj.visible ~= false,
+        properties = copyProperties(obj.properties)
+    }
 end
 
-local function buildMap(raw, baseDir)
-    if type(raw) ~= "table" then
-        print("STB buildMap failed: map data is not a table")
-        return nil
+function Tiled.load(path, drawX, drawY)
+    local mapData = safeRequire(path)
+    if not mapData or type(mapData) ~= "table" then
+        error("Cannot require source code: " .. tostring(path))
     end
 
-    local self = setmetatable({}, STB)
+    local map = {}
+    map.data = mapData
+    map.drawX = drawX or 0
+    map.drawY = drawY or 0
 
-    self.raw = raw
-    self.baseDir = baseDir or ""
-    self.width = raw.width or 0
-    self.height = raw.height or 0
-    self.tilewidth = raw.tilewidth or 0
-    self.tileheight = raw.tileheight or 0
-    self.orientation = raw.orientation or "orthogonal"
+    map.tileWidth = mapData.tilewidth
+    map.tileHeight = mapData.tileheight
+    map.width = mapData.width
+    map.height = mapData.height
+    map.pixelWidth = map.width * map.tileWidth
+    map.pixelHeight = map.height * map.tileHeight
 
-    if self.orientation ~= "orthogonal" then
-        print("STB only supports orthogonal maps")
-        return nil
+    map.layers = mapData.layers or {}
+    map.tilesets = buildTilesets(mapData)
+    map.tilesetImages = {}
+
+    map.collisionObjects = {}
+    map.ObjectLayer = {}
+    map.TileLayer = {}
+    map.ImageLayer = {}
+    map.AllObjects = {}
+
+    for i = 1, #map.tilesets do
+        local ts = map.tilesets[i]
+        if ts.imagePath then
+            map.tilesetImages[i] = Resources.load(ts.imagePath)
+        end
     end
 
-    self.pixelWidth = self.width * self.tilewidth
-    self.pixelHeight = self.height * self.tileheight
+    for i = 1, #map.layers do
+        local layer = map.layers[i]
 
-    self.tilesets = {}
-    self.layers = {}
-    self.tileGidMap = {}
+        if layer.type == "objectgroup" then
+            local objectLayer = {
+                name = layer.name or ("ObjectLayer" .. i),
+                id = layer.id,
+                visible = layer.visible ~= false,
+                opacity = layer.opacity or 1,
+                objects = {},
+                byName = {},
+                byId = {},
+                properties = copyProperties(layer.properties)
+            }
 
-    self:_loadTilesets(raw.tilesets or {})
-    self:_loadLayers(raw.layers or {})
+            for j = 1, #(layer.objects or {}) do
+                local obj = normalizeObject(layer.objects[j])
+                table.insert(objectLayer.objects, obj)
+                table.insert(map.AllObjects, obj)
 
-    return self
-end
+                objectLayer.byId[obj.id] = obj
 
-function STB.fromTable(raw, baseDir)
-    return buildMap(raw, baseDir or "")
-end
+                if obj.name ~= "" then
+                    if not objectLayer.byName[obj.name] then
+                        objectLayer.byName[obj.name] = {}
+                    end
+                    table.insert(objectLayer.byName[obj.name], obj)
+                end
+            end
 
-function STB:_loadTilesets(tilesets)
-    for _, ts in ipairs(tilesets) do
-        if ts.filename then
-            print("STB error: external TSX tilesets are not supported. Please embed tilesets in Tiled.")
+            map.ObjectLayer[objectLayer.name] = objectLayer
+
+            if objectLayer.name == "CollisionLayer" then
+                map.collisionObjects = objectLayer.objects
+            end
+
+        elseif layer.type == "tilelayer" then
+            map.TileLayer[layer.name or ("TileLayer" .. i)] = layer
+        elseif layer.type == "imagelayer" then
+            map.ImageLayer[layer.name or ("ImageLayer" .. i)] = layer
+        end
+    end
+
+    function map:getObjectLayer(name)
+        return self.ObjectLayer[name]
+    end
+
+    function map:getTileLayer(name)
+        return self.TileLayer[name]
+    end
+
+    function map:getObject(layerName, objectName, index)
+        local layer = self.ObjectLayer[layerName]
+        if not layer then
+            return nil
+        end
+
+        local list = layer.byName[objectName]
+        if not list then
+            return nil
+        end
+
+        return list[index or 1]
+    end
+
+    function map:getObjects(layerName, objectName)
+        local layer = self.ObjectLayer[layerName]
+        if not layer then
+            return nil
+        end
+
+        if not objectName then
+            return layer.objects
+        end
+
+        return layer.byName[objectName]
+    end
+
+    function map:checkCollisionRect(rx, ry, rw, rh)
+        local ax1 = rx
+        local ay1 = ry
+        local ax2 = rx + rw
+        local ay2 = ry + rh
+
+        for i = 1, #self.collisionObjects do
+            local obj = self.collisionObjects[i]
+
+            local bx1 = obj.x
+            local by1 = obj.y
+            local bx2 = obj.x + obj.w
+            local by2 = obj.y + obj.h
+
+            if ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1 then
+                return true, obj
+            end
+        end
+
+        return false, nil
+    end
+
+    function map:drawTile(layer, index, camera)
+        local gid = layer.data[index]
+        if not gid or gid == 0 then
             return
         end
 
-        local tileset = copyTable(ts)
-        tileset.firstgid = tileset.firstgid or 1
-        tileset._columns = tileset.columns or 1
-        tileset._spacing = tileset.spacing or 0
-        tileset._margin = tileset.margin or 0
-        tileset._tilecount = tileset.tilecount or 0
-
-        if tileset.image then
-            tileset._imagePath = normalizePath(self.baseDir, tileset.image)
-            tileset._image = Resources.load(tileset._imagePath)
+        local ts = getTilesetForGid(self.tilesets, gid)
+        if not ts then
+            return
         end
 
-        table.insert(self.tilesets, tileset)
+        local img = nil
+        for t = 1, #self.tilesets do
+            if self.tilesets[t] == ts then
+                img = self.tilesetImages[t]
+                break
+            end
+        end
 
-        for localId = 0, tileset._tilecount - 1 do
-            local gid = tileset.firstgid + localId
-            self.tileGidMap[gid] = {
-                tileset = tileset,
-                localId = localId
-            }
+        if not img or ts.columns <= 0 then
+            return
+        end
+
+        local localId = gid - ts.firstgid
+        local sx = (localId % ts.columns) * ts.tilewidth
+        local sy = math.floor(localId / ts.columns) * ts.tileheight
+
+        local col = (index - 1) % self.width
+        local row = math.floor((index - 1) / self.width)
+
+        local worldX = self.drawX + col * self.tileWidth
+        local worldY = self.drawY + row * self.tileHeight
+
+        tex(
+            img,
+            camera:applyX(worldX),
+            camera:applyY(worldY),
+            self.tileWidth,
+            self.tileHeight,
+            sx,
+            sy,
+            ts.tilewidth,
+            ts.tileheight
+        )
+    end
+
+    function map:drawLayerByName(layerName, camera)
+        local layer = self.TileLayer[layerName]
+        if not layer or layer.visible == false then
+            return
+        end
+
+        for index = 1, #(layer.data or {}) do
+            self:drawTile(layer, index, camera)
         end
     end
-end
 
-function STB:_loadLayers(layers)
-    for _, layer in ipairs(layers) do
-        local L = copyTable(layer)
-        L.visible = (L.visible ~= false)
-        L.offsetx = L.offsetx or 0
-        L.offsety = L.offsety or 0
+    function map:drawLayers(layerNames, camera)
+        for i = 1, #layerNames do
+            self:drawLayerByName(layerNames[i], camera)
+        end
+    end
 
-        if L.type == "tilelayer" then
-            self:_prepareTileLayer(L)
-        elseif L.type == "objectgroup" then
-            L.objects = L.objects or {}
+    function map:drawVerticalLayerPass(layerName, camera, splitY, drawAbove)
+        local layer = self.TileLayer[layerName]
+        if not layer or layer.visible == false then
+            return
         end
 
-        table.insert(self.layers, L)
-    end
-end
+        local data = layer.data or {}
 
-function STB:_prepareTileLayer(layer)
-    layer._cells = {}
+        for index = 1, #data do
+            local gid = data[index]
+            if gid and gid ~= 0 then
+                local col = (index - 1) % self.width
+                local row = math.floor((index - 1) / self.width)
 
-    local data = layer.data or {}
-    local width = layer.width or self.width
-    local height = layer.height or self.height
+                local tileTop = self.drawY + row * self.tileHeight
+                local tileBottom = tileTop + self.tileHeight
 
-    for y = 1, height do
-        layer._cells[y] = {}
-        for x = 1, width do
-            local index = (y - 1) * width + x
-            local gid = data[index] or 0
-
-            if gid ~= 0 then
-                local info = self.tileGidMap[gid]
-                if info then
-                    layer._cells[y][x] = {
-                        gid = gid,
-                        localId = info.localId,
-                        tileset = info.tileset
-                    }
+                if drawAbove then
+                    if tileBottom > splitY then
+                        self:drawTile(layer, index, camera)
+                    end
+                else
+                    if tileBottom <= splitY then
+                        self:drawTile(layer, index, camera)
+                    end
                 end
             end
         end
     end
-end
 
-function STB:_getTileSourceRect(tileset, localId)
-    local tw = tileset.tilewidth
-    local th = tileset.tileheight
-    local columns = tileset._columns
-    local spacing = tileset._spacing
-    local margin = tileset._margin
-
-    local col = localId % columns
-    local row = math.floor(localId / columns)
-
-    local sx = margin + col * (tw + spacing)
-    local sy = margin + row * (th + spacing)
-
-    return sx, sy, tw, th
-end
-
-function STB:update(dt)
-end
-
-function STB:render(camX, camY)
-    camX = camX or 0
-    camY = camY or 0
-
-    for _, layer in ipairs(self.layers) do
-        if layer.visible and layer.type == "tilelayer" then
-            self:_renderTileLayer(layer, camX, camY)
+    function map:drawVerticalLayersBelow(layerNames, camera, splitY)
+        for i = 1, #layerNames do
+            self:drawVerticalLayerPass(layerNames[i], camera, splitY, false)
         end
     end
-end
 
-function STB:_renderTileLayer(layer, camX, camY)
-    local tw = self.tilewidth
-    local th = self.tileheight
-
-    for y = 1, #layer._cells do
-        local row = layer._cells[y]
-        for x = 1, #row do
-            local cell = row[x]
-            if cell and cell.tileset and cell.tileset._image then
-                local sx, sy, sw, sh = self:_getTileSourceRect(cell.tileset, cell.localId)
-                local dx = (x - 1) * tw + layer.offsetx + camX
-                local dy = (y - 1) * th + layer.offsety + camY
-
-                tex(cell.tileset._image, dx, dy, tw, th, sx, sy, sw, sh)
-            end
+    function map:drawVerticalLayersAbove(layerNames, camera, splitY)
+        for i = 1, #layerNames do
+            self:drawVerticalLayerPass(layerNames[i], camera, splitY, true)
         end
     end
+
+    return map
 end
 
-function STB:getLayer(name)
-    for _, layer in ipairs(self.layers) do
-        if layer.name == name then
-            return layer
-        end
-    end
-    return nil
-end
-
-function STB:getObjects(layerName)
-    local layer = self:getLayer(layerName)
-    if layer and layer.type == "objectgroup" then
-        return layer.objects
-    end
-    return {}
-end
-
-function STB:getObject(layerName, objectName)
-    local objs = self:getObjects(layerName)
-    for _, obj in ipairs(objs) do
-        if obj.name == objectName then
-            return obj
-        end
-    end
-    return nil
-end
-
-return STB
+return Tiled
